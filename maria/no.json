@@ -1,0 +1,10 @@
+{
+        "driver": "sqlite",
+        "config": {
+                        "user": "sa",
+                    "password": "1001",
+                      "server": "10.17.31.95",
+                    "database": "db"
+                  }
+}
+

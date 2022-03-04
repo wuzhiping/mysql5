@@ -1,0 +1,33 @@
+version: '2'
+services:
+  mysqldev:
+    image: mysql:5.7.15
+    restart: always
+    hostname: mysqldev
+    ports:
+      - "3306:3306"
+    environment:
+      MYSQL_ROOT_PASSWORD: 123456
+    volumes:
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
+      - ./data/:/var/lib/mysql/
+      - ./conf/:/etc/mysql/conf.d/
+
+  orm:
+    image: shawoo/bpm:ad
+    restart: always
+    command: top
+    volumes:
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
+      - ./maria/:/opt/bpm/orm/
+    environment:
+      - TERM=dumb
+      - LD_LIBRARY_PATH=/usr/local/sap/nwrfcsdk/lib
+    links:
+      - mysqldev
+    stdin_open: true
+    tty: true
+    privileged: true
+

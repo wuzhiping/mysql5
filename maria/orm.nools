@@ -1,0 +1,418 @@
+global sworm = require('sworm');
+global Formatter = require('atma-formatter');
+
+define Inbound {
+    header:null,
+    payload:null,
+    constructor : function(header,payload){
+        this.payload = payload;
+        this.header = header;
+    }
+}
+
+rule "SCHEMA-mysql"
+{
+    salience: 100;
+    when {
+        i : Inbound i.header.db.driver == 'mysql';
+    }
+    then {
+        //outBound.DEBUG = true;
+        //
+        sworm.db(i.header.db).then(function (db) {
+            db.query("desc "+i.header.model,
+                     [])
+              .then(function(result){
+                        outBound.schema = result;
+                    },
+                    function(err){
+                    })
+              .finally(function() {
+                         next();
+			 db.close();
+              });
+        });
+    }
+}
+
+rule "SCHEMA-mssql"
+{
+    salience: 99;
+    when {
+        i : Inbound i.header.db.driver == 'mssql';
+    }
+    then {
+        //outBound.DEBUG = true;
+        //
+        sworm.db(i.header.db).then(function (db) {
+            db.query("sp_columns "+i.header.model,
+                     [])
+              .then(function(result){
+                        outBound.schema = [];
+                        for(var n=0;n<result.length;n++){
+                           outBound.schema.push(
+                           {
+                               Field:result[n].COLUMN_NAME,
+                               Type:result[n].TYPE_NAME,
+                               Null:result[n].NULLABLE,
+                               Key:''
+                           });
+                        }
+                    },
+                    function(err){
+                    })
+              .finally(function() {
+              //----------------------------------
+                db.query("sp_pkeys @table_name = "+i.header.model,
+                         [])
+                  .then(function(result){
+                          for(var m=0;m<result.length;m++){
+                             for(var n=0;n<outBound.schema.length;n++){
+                                if(result[m].COLUMN_NAME == outBound.schema[n].Field)
+                                   outBound.schema[n].Key = 'PRI';
+                             }
+                          }
+                        },
+                        function(err){
+                        })
+                  .finally(function() {
+                             next();
+                             db.close();
+                  });
+              //----------------------------------
+              });
+        });
+    }
+}
+
+rule "SCHEMA"
+{
+    salience: 95;
+    when {
+        i : Inbound 1 == 1;
+    }
+    then {
+        //outBound.DEBUG = true;
+
+        console.dir( i.header.db.config.database + '/' + i.header.model +'/' + i.payload.action + ' ('+ i.header.method + ') ');
+        //console.dir(i.payload.data);
+
+        outBound.IDs = [];
+        
+        if(!outBound.schema) throw "db not supported: "+i.header.db.driver;
+        for(var n=0;n<outBound.schema.length;n++){
+            if(outBound.schema[n].Key == 'PRI')
+              outBound.IDs.push(outBound.schema[n].Field);
+        }
+        //console.dir(outBound.IDs);
+        //console.dir(outBound.schema);
+    }
+}
+rule "CREATE"
+{
+    salience: 9;
+    when {
+        i : Inbound (i.header.method == "PUT" && i.payload.action == "PUT") || (i.header.method == "PUT" && i.payload.action == "SAVE");
+    }
+    then {
+	if(outBound.action == "create" || (i.header.method == "PUT" && i.payload.action == "PUT")){
+        sworm.db(i.header.db).then(function (db) {
+            var model = db.model({table: i.header.model,id:outBound.IDs});
+
+            var entity = model(i.payload.data);
+              entity.save()
+                    .then(function (result) {
+                        //console.dir(entity.identity());
+                        var priName = null,priCount = 0;
+                        for(var j=0;j<outBound.schema.length;j++){
+                            if(outBound.schema[j].Key == 'PRI'){
+                                priCount++;
+                                priName = outBound.schema[j].Field;
+                            }
+                        }
+                        if(priCount==1){
+                            if(!entity[priName]){
+                                entity[priName] = entity.id;
+                            }
+                        }
+                        outBound.result = entity;
+                    },
+                    function(err){
+			console.log(err);
+                        outBound.err = err;
+                    })
+                    .finally(function() {
+			 next();
+                         db.close();
+                    });
+
+        });
+	} else {
+		next();
+	}
+    }
+}
+
+rule "SAVE"
+{
+    salience: 10;
+    when {
+        i : Inbound i.header.method == "PUT" && i.payload.action == "SAVE";
+    }
+    then {
+	outBound.action = null;
+        var query = "SELECT * FROM "+i.header.model+" WHERE ";
+        var parameters = {};
+        var isHas = false;
+        var ids = [];
+        for(var j=0;j<outBound.schema.length;j++){
+            if(outBound.schema[j].Key == 'PRI'){
+                if(isHas){
+                    query +=" AND ";
+                }
+                isHas = true;
+                if(i.payload.data[outBound.schema[j].Field == null]){
+			outBound.action = "create";
+                } else {
+                    query += outBound.schema[j].Field +"=@" +outBound.schema[j].Field;
+                    parameters[outBound.schema[j].Field] = i.payload.data[outBound.schema[j].Field];
+                    ids.push(outBound.schema[j].Field);
+                }
+            }
+        }
+	if(outBound.action==null){
+            sworm.db(i.header.db).then(function (db) {
+                var model = db.model({table: i.header.model,id:ids});
+                var entity = model(i.payload.data);
+                model.query(query,
+                         parameters)
+                  .then(function(result){
+                        if(result.length>0){
+				outBound.action = "update";
+                        } else {
+				outBound.action = "create";
+                        }
+                    },
+                    function(err){
+                        outBound.err = err;
+                    })
+                  .finally(function() {
+                         next();
+                         db.close();
+                  });
+            });
+        } else {
+            next();
+        }
+    }
+}
+
+rule "UPDATE"
+{
+    salience: 8;
+    when {
+        i : Inbound (i.header.method == "POST" && i.payload.action == "POST") || (i.header.method == "PUT" && i.payload.action == "SAVE");
+    }
+    then {
+	if(outBound.action == "update" || (i.header.method == "POST" && i.payload.action == "POST")){
+        var query = "select * from "+i.header.model+" where ";
+        var parameters = {};
+        var isHas = false;
+        var ids = [];
+        for(var j=0;j<outBound.schema.length;j++){
+            if(outBound.schema[j].Key == 'PRI'){
+                if(isHas){
+                    query +=" and ";
+                }
+                isHas = true;
+                if(i.payload.data[outBound.schema[j].Field] == null){
+                    outBound.err = new Error("数据不完整,缺少主键"+outBound.schema[j].Field);
+                } else {
+                    query += outBound.schema[j].Field +"=@" +outBound.schema[j].Field;
+                    parameters[outBound.schema[j].Field] = i.payload.data[outBound.schema[j].Field];
+                    ids.push(outBound.schema[j].Field);
+                }
+            }
+        }
+
+        if(!outBound.err){
+        sworm.db(i.header.db).then(function (db) {
+            var model = db.model({table: i.header.model,id:ids});
+            var entity = model(i.payload.data);
+            model.query(query,
+                    parameters)
+                  .then(function(result){
+                        if(result.length>0){
+                            var data = result[0];
+                            for(var j in i.payload.data){
+                                data[j] = i.payload.data[j];
+                            }
+                            var model = db.model({table: i.header.model,id:ids});
+                            var entity = model(data,{saved:true,modified:true});
+                            return entity.save()
+                                .then(function (result) {
+                                    outBound.result = entity;
+                                },
+                                function(err){
+                                     outBound.err = err;
+                                })
+                                .finally(function() {
+				     next();
+                                     db.close();
+                                });
+
+                        } else {
+                            outBound.err = new Error("未找到数据");
+                            next();
+                            db.close();
+                        }
+                    },
+                    function(err){
+                        outBound.err = err;
+                    })
+                  .finally(function() {
+                  });
+            });
+        } else {
+            next();
+        }
+	} else {
+	    next();
+	}
+    }
+}
+
+rule "DELETE"
+{
+    salience: 7;
+    when {
+        i : Inbound i.header.method == "DELETE" && i.payload.action == "DELETE";
+    }
+    then {
+        //console.dir("DELETE");
+        var query = "delete from "+i.header.model+" where ";
+        var parameters = {};
+        var isHas = false;
+        for(var j=0;j<outBound.schema.length;j++){
+            if(outBound.schema[j].Key == 'PRI'){
+                if(isHas){
+                    query +=" AND ";
+                }
+                isHas = true;
+                if(i.payload.data[outBound.schema[j].Field] == null){
+                    //outBound.err =
+                    throw  new Error("DELETE 数据不完整,缺少主键PK "+outBound.schema[j].Field);
+                } else {
+                    query += outBound.schema[j].Field +"=@" +outBound.schema[j].Field;
+                    parameters[outBound.schema[j].Field] = i.payload.data[outBound.schema[j].Field];
+                }
+            }
+        } //END for
+ 
+        if(!outBound.err){
+            sworm.db(i.header.db).then(function (db) {
+                db.query(query,
+                         parameters)
+                  .then(function(result){
+     	                   outBound.result = true;//result.affectedRows==1;
+                       },
+                       function(err){
+                          console.dir(err);
+                          outBound.err = err;
+                       })
+                  .finally(function() {
+                         next();
+                         db.close();
+                  });
+            });
+        } else {
+            next();
+        }
+    }
+}
+
+rule "READ"
+{
+    salience: 6;
+    when {
+        i : Inbound (i.header.method == "POST" && i.payload.action == "GET") 
+                 || (i.header.method == "POST" && i.payload.action == "POST") 
+                 || (i.header.method == "PUT" && i.payload.action == "PUT");
+    }
+    then {
+        //console.dir("GET");
+	if(outBound.result){
+		i.payload.data = outBound.result;
+	}
+        var query = "SELECT * FROM "+i.header.model+" WHERE ";
+        var parameters = {};
+        var isHas = false;
+        var ids = [];
+        for(var j=0;j<outBound.schema.length;j++){
+            if(outBound.schema[j].Key == 'PRI'){
+                if(isHas){
+                    query +=" AND ";
+                }
+                isHas = true;
+                if(!i.payload.data[outBound.schema[j].Field]){
+                    outBound.err = new Error("数据不完整,缺少主键"+outBound.schema[j].Field);
+                } else {
+                    query += outBound.schema[j].Field +"=@" +outBound.schema[j].Field;
+                    parameters[outBound.schema[j].Field] = i.payload.data[outBound.schema[j].Field];
+                    ids.push(outBound.schema[j].Field);
+                }
+            }
+        }
+        if(!outBound.err){
+            sworm.db(i.header.db).then(function (db) {
+                var model = db.model({table: i.header.model,id:ids});
+                var entity = model(i.payload.data);
+                //entity.identity(function(result){console.dir(result)});
+                //console.dir(entity);
+                model.query(query,
+                         parameters)
+                  .then(function(result){
+			//console.dir(result[0]);
+                        if(result.length>0){
+                            for(var j=0;j<outBound.schema.length;j++){
+                                if(outBound.schema[j].Type == 'timestamp' || outBound.schema[j].Type == 'datetime'){
+                                    //result[0][outBound.schema[j].Field] = result[0][outBound.schema[j].Field].toLocaleString();
+                                    if(result[0][outBound.schema[j].Field]){
+                                        result[0][outBound.schema[j].Field] = Formatter(result[0][outBound.schema[j].Field], "yyyy-MM-ddTHH:mm:ssZ");
+                                    }
+                                }
+                            }
+                            outBound.result = result[0];
+                        } else {
+                            outBound.result = null;
+                        }
+                    },
+                    function(err){
+                        outBound.err = err;
+                    })
+                  .finally(function() {
+                         next();
+                         db.close();
+                  });
+            });
+        } else {
+            next();
+        }
+
+    }
+}
+
+rule "OPTION"
+{
+    salience: 5;
+    when {
+        i : Inbound i.header.method == "POST" && i.payload.action == "OPTIONS";
+    }
+    then {
+        //console.dir("OPTIONS");
+        outBound.result = outBound.schema;
+        next();
+    }
+}
+
+
